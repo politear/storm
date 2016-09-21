@@ -38,3 +38,4 @@ public class TopicKeyValueTupleBuilder<K, V> extends KafkaSpoutTupleBuilder<K,V>
                 consumerRecord.value());
     }
 }
+

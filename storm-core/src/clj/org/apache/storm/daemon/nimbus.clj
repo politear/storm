@@ -29,7 +29,7 @@
            [java.util Collections List HashMap]
            [org.apache.storm.generated NimbusSummary])
   (:import [java.nio ByteBuffer]
-           [java.util Collections List HashMap ArrayList Iterator])
+           [java.util Collections List HashMap ArrayList Iterator Map])
   (:import [org.apache.storm.blobstore AtomicOutputStream BlobStoreAclHandler
             InputStreamWithMeta KeyFilter KeySequenceNumber BlobSynchronizer BlobStoreUtils])
   (:import [java.io File FileOutputStream FileInputStream])
@@ -641,7 +641,7 @@
          (Utils/reverseMap)
          clojurify-structure
          (map-val sort)
-         ((fn [ & maps ] (Utils/joinMaps (into-array (into [component->executors] maps)))))
+         ((fn [ & maps ] (Utils/joinMaps (into-array Map (into [component->executors] maps)))))
          (clojurify-structure)
          (map-val (partial apply (fn part-fixed [a b] (Utils/partitionFixed a b))))
          (mapcat second)
@@ -1616,7 +1616,7 @@
                :all-components all-components
                :launch-time-secs launch-time-secs
                :assignment assignment
-               :beats beats
+               :beats (or beats {})
                :topology topology
                :task->component task->component
                :base base}))
@@ -1995,7 +1995,8 @@
               executor-summaries (dofor [[executor [node port]] (:executor->node+port assignment)]
                                    (let [host (-> assignment :node->host (get node))
                                             heartbeat (.get beats (StatsUtil/convertExecutor executor))
-                                            hb (if heartbeat (.get heartbeat "heartbeat"))
+                                            heartbeat (or heartbeat {})
+                                            hb (.get heartbeat "heartbeat")
                                             excutorstats (if hb (.get hb "stats"))
                                             excutorstats (if excutorstats
                                                     (StatsUtil/thriftifyExecutorStats excutorstats))]

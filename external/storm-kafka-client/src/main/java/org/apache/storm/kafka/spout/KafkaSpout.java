@@ -32,19 +32,7 @@ import org.apache.storm.topology.base.BaseRichSpout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.NavigableSet;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -52,6 +40,8 @@ import static org.apache.storm.kafka.spout.KafkaSpoutConfig.FirstPollOffsetStrat
 import static org.apache.storm.kafka.spout.KafkaSpoutConfig.FirstPollOffsetStrategy.LATEST;
 import static org.apache.storm.kafka.spout.KafkaSpoutConfig.FirstPollOffsetStrategy.UNCOMMITTED_EARLIEST;
 import static org.apache.storm.kafka.spout.KafkaSpoutConfig.FirstPollOffsetStrategy.UNCOMMITTED_LATEST;
+import org.apache.storm.kafka.spout.internal.KafkaConsumerFactory;
+import org.apache.storm.kafka.spout.internal.KafkaConsumerFactoryDefault;
 
 public class KafkaSpout<K, V> extends BaseRichSpout {
     private static final Logger LOG = LoggerFactory.getLogger(KafkaSpout.class);
@@ -62,6 +52,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     // Kafka
     private final KafkaSpoutConfig<K, V> kafkaSpoutConfig;
+    private final KafkaConsumerFactory kafkaConsumerFactory;
     private transient KafkaConsumer<K, V> kafkaConsumer;
     private transient boolean consumerAutoCommitMode;
 
@@ -84,8 +75,14 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
 
     public KafkaSpout(KafkaSpoutConfig<K, V> kafkaSpoutConfig) {
+        this(kafkaSpoutConfig, new KafkaConsumerFactoryDefault());
+    }
+    
+    //This constructor is here for testing
+    KafkaSpout(KafkaSpoutConfig<K, V> kafkaSpoutConfig, KafkaConsumerFactory<K, V> kafkaConsumerFactory) {
         this.kafkaSpoutConfig = kafkaSpoutConfig;                 // Pass in configuration
         this.kafkaSpoutStreams = kafkaSpoutConfig.getKafkaSpoutStreams();
+        this.kafkaConsumerFactory = kafkaConsumerFactory;
     }
 
     @Override
@@ -145,6 +142,10 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             }
 
             retryService.retainAll(partitions);
+            
+            //Emitted messages for partitions that are no longer assigned to this spout can't be acked, and they shouldn't be retried. Remove them from emitted.
+            Set<TopicPartition> partitionsSet = new HashSet(partitions);
+            emitted.removeIf((msgId) -> !partitionsSet.contains(msgId.getTopicPartition()));
 
             for (TopicPartition tp : partitions) {
                 final OffsetAndMetadata committedOffset = kafkaConsumer.committed(tp);
@@ -199,20 +200,22 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     @Override
     public void nextTuple() {
-        if (initialized) {
-            if (commit()) {
-                commitOffsetsForAckedTuples();
-            }
+        synchronized (kafkaConsumer) {
+            if (initialized) {
+                if (commit()) {
+                    commitOffsetsForAckedTuples();
+                }
 
-            if (poll()) {
-                setWaitingToEmit(pollKafkaBroker());
-            }
+                if (poll()) {
+                    setWaitingToEmit(pollKafkaBroker());
+                }
 
-            if (waitingToEmit()) {
-                emit();
+                if (waitingToEmit()) {
+                    emit();
+                }
+            } else {
+                LOG.debug("Spout not initialized. Not sending tuples until initialization completes");
             }
-        } else {
-            LOG.debug("Spout not initialized. Not sending tuples until initialization completes");
         }
     }
 
@@ -273,30 +276,38 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     // ======== emit  =========
     private void emit() {
-        emitTupleIfNotEmitted(waitingToEmit.next());
-        waitingToEmit.remove();
+        while(!emitTupleIfNotEmitted(waitingToEmit.next()) && waitingToEmit.hasNext()) {
+            waitingToEmit.remove();
+        }
     }
 
     /**
      * Emits one tuple per record
      */
-    private void emitTupleIfNotEmitted(ConsumerRecord<K, V> record) {
+    private boolean emitTupleIfNotEmitted(ConsumerRecord<K, V> record) {
         final TopicPartition tp = new TopicPartition(record.topic(), record.partition());
         final KafkaSpoutMessageId msgId = new KafkaSpoutMessageId(record);
 
         if (acked.containsKey(tp) && acked.get(tp).contains(msgId)) {   // has been acked
             LOG.trace("Tuple for record [{}] has already been acked. Skipping", record);
+            return false;
         } else if (emitted.contains(msgId)) {   // has been emitted and it's pending ack or fail
             LOG.trace("Tuple for record [{}] has already been emitted. Skipping", record);
-        } else if (!retryService.isScheduled(msgId) || retryService.isReady(msgId)) {   // not scheduled <=> never failed (i.e. never emitted) or ready to be retried
-            final List<Object> tuple = tuplesBuilder.buildTuple(record);
-            kafkaSpoutStreams.emit(collector, tuple, msgId);
-            emitted.add(msgId);
-            numUncommittedOffsets++;
-            if (retryService.isReady(msgId)) { // has failed. Is it ready for retry ?
-                retryService.remove(msgId);  // re-emitted hence remove from failed
+            return false;
+        } else {
+            boolean isScheduled = retryService.isScheduled(msgId);
+            if (!isScheduled || retryService.isReady(msgId)) {   // not scheduled <=> never failed (i.e. never emitted) or ready to be retried
+                final List<Object> tuple = tuplesBuilder.buildTuple(record);
+                kafkaSpoutStreams.emit(collector, tuple, msgId);
+
+                emitted.add(msgId);
+                numUncommittedOffsets++;
+                if (isScheduled) { // Was scheduled for retry, now being re-emitted. Remove from schedule.
+                    retryService.remove(msgId);
+                }
+                LOG.debug("Emitted tuple [{}] for record [{}]", tuple, record);
             }
-            LOG.trace("Emitted tuple [{}] for record [{}]", tuple, record);
+            return true;
         }
     }
 
@@ -329,7 +340,13 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     @Override
     public void ack(Object messageId) {
+        //LOG.info("Received ack: " + messageId);
         final KafkaSpoutMessageId msgId = (KafkaSpoutMessageId) messageId;
+        if(!emitted.contains(msgId)) {
+            LOG.debug("Received ack for tuple this spout is no longer tracking. Partitions may have been reassigned. Ignoring message [{}]", msgId);
+            return;
+        }
+        
         if (!consumerAutoCommitMode) {  // Only need to keep track of acked tuples if commits are not done automatically
             acked.get(msgId.getTopicPartition()).add(msgId);
         }
@@ -340,9 +357,15 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     @Override
     public void fail(Object messageId) {
+        //LOG.info("Received fail: " + messageId);
+
         final KafkaSpoutMessageId msgId = (KafkaSpoutMessageId) messageId;
-        emitted.remove(msgId);
+        if(!emitted.contains(msgId)) {
+            LOG.debug("Received fail for tuple this spout is no longer tracking. Partitions may have been reassigned. Ignoring message [{}]", msgId);
+            return;
+        }
         if (msgId.numFails() < maxRetries) {
+            emitted.remove(msgId);
             msgId.incrementNumFails();
             retryService.schedule(msgId);
         } else { // limit to max number of retries
@@ -359,8 +382,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
     }
 
     private void subscribeKafkaConsumer() {
-        kafkaConsumer = new KafkaConsumer<>(kafkaSpoutConfig.getKafkaProps(),
-                kafkaSpoutConfig.getKeyDeserializer(), kafkaSpoutConfig.getValueDeserializer());
+        kafkaConsumer = kafkaConsumerFactory.createConsumer(kafkaSpoutConfig);
 
         if (kafkaSpoutStreams instanceof KafkaSpoutStreamsNamedTopics) {
             final List<String> topics = ((KafkaSpoutStreamsNamedTopics) kafkaSpoutStreams).getTopics();
