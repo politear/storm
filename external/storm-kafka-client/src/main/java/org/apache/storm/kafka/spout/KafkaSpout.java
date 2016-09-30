@@ -225,7 +225,7 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
 
     private boolean poll() {
         final int maxUncommittedOffsets = kafkaSpoutConfig.getMaxUncommittedOffsets();
-        final boolean poll = !waitingToEmit() && numUncommittedOffsets < maxUncommittedOffsets;
+        final boolean poll = !waitingToEmit() && (numUncommittedOffsets < maxUncommittedOffsets || !retryService.retriableTopicPartitions().isEmpty());
 
         if (!poll) {
             if (waitingToEmit()) {
@@ -512,8 +512,8 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
                     break;
                 } else {
                     //Received a redundant ack. Ignore and continue processing.
-                    LOG.debug("topic-partition [{}] has unexpected offset [{}]. Current committed Offset [{}]",
-                            tp, currOffset,  committedOffset);
+                    LOG.warn("topic-partition [{}] has unexpected offset [{}]. Current committed Offset [{}]",
+                            tp, currOffset, committedOffset);
                 }
             }
 
