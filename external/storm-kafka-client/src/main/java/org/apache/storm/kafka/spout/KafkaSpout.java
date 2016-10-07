@@ -18,11 +18,7 @@
 
 package org.apache.storm.kafka.spout;
 
-import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.storm.kafka.spout.KafkaSpoutConfig.FirstPollOffsetStrategy;
 import org.apache.storm.spout.SpoutOutputCollector;
@@ -156,35 +152,35 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
             LOG.info("Initialization complete");
         }
 
-        /**
-         * sets the cursor to the location dictated by the first poll strategy and returns the fetch offset
-         */
-        private long doSeek(TopicPartition tp, OffsetAndMetadata committedOffset) {
-            long fetchOffset;
-            if (committedOffset != null) {             // offset was committed for this TopicPartition
-                if (firstPollOffsetStrategy.equals(EARLIEST)) {
-                    kafkaConsumer.seekToBeginning(toArrayList(tp));
-                    fetchOffset = kafkaConsumer.position(tp);
-                } else if (firstPollOffsetStrategy.equals(LATEST)) {
-                    kafkaConsumer.seekToEnd(toArrayList(tp));
-                    fetchOffset = kafkaConsumer.position(tp);
-                } else {
-                    // By default polling starts at the last committed offset. +1 to point fetch to the first uncommitted offset.
-                    fetchOffset = committedOffset.offset() + 1;
-                    kafkaConsumer.seek(tp, fetchOffset);
-                }
-            } else {    // no commits have ever been done, so start at the beginning or end depending on the strategy
-                if (firstPollOffsetStrategy.equals(EARLIEST) || firstPollOffsetStrategy.equals(UNCOMMITTED_EARLIEST)) {
-                    kafkaConsumer.seekToBeginning(toArrayList(tp));
-                } else if (firstPollOffsetStrategy.equals(LATEST) || firstPollOffsetStrategy.equals(UNCOMMITTED_LATEST)) {
-                    kafkaConsumer.seekToEnd(toArrayList(tp));
-                }
-                fetchOffset = kafkaConsumer.position(tp);
-            }
-            return fetchOffset;
-        }
-    }
 
+    }
+    /**
+     * sets the cursor to the location dictated by the first poll strategy and returns the fetch offset
+     */
+    private long doSeek(TopicPartition tp, OffsetAndMetadata committedOffset) {
+        long fetchOffset;
+        if (committedOffset != null) {             // offset was committed for this TopicPartition
+            if (firstPollOffsetStrategy.equals(EARLIEST)) {
+                kafkaConsumer.seekToBeginning(toArrayList(tp));
+                fetchOffset = kafkaConsumer.position(tp);
+            } else if (firstPollOffsetStrategy.equals(LATEST)) {
+                kafkaConsumer.seekToEnd(toArrayList(tp));
+                fetchOffset = kafkaConsumer.position(tp);
+            } else {
+                // By default polling starts at the last committed offset. +1 to point fetch to the first uncommitted offset.
+                fetchOffset = committedOffset.offset() + 1;
+                kafkaConsumer.seek(tp, fetchOffset);
+            }
+        } else {    // no commits have ever been done, so start at the beginning or end depending on the strategy
+            if (firstPollOffsetStrategy.equals(EARLIEST) || firstPollOffsetStrategy.equals(UNCOMMITTED_EARLIEST)) {
+                kafkaConsumer.seekToBeginning(toArrayList(tp));
+            } else if (firstPollOffsetStrategy.equals(LATEST) || firstPollOffsetStrategy.equals(UNCOMMITTED_LATEST)) {
+                kafkaConsumer.seekToEnd(toArrayList(tp));
+            }
+            fetchOffset = kafkaConsumer.position(tp);
+        }
+        return fetchOffset;
+    }
     private Collection<TopicPartition> toArrayList(final TopicPartition tp) {
         return new ArrayList<TopicPartition>(1){{add(tp);}};
     }
@@ -255,10 +251,27 @@ public class KafkaSpout<K, V> extends BaseRichSpout {
     private ConsumerRecords<K, V> pollKafkaBroker() {
         doSeekRetriableTopicPartitions();
 
-        final ConsumerRecords<K, V> consumerRecords = kafkaConsumer.poll(kafkaSpoutConfig.getPollTimeoutMs());
-        final int numPolledRecords = consumerRecords.count();
-        LOG.debug("Polled [{}] records from Kafka. [{}] uncommitted offsets across all topic partitions", numPolledRecords, numUncommittedOffsets);
-        return consumerRecords;
+        try {
+            final ConsumerRecords<K, V> consumerRecords = kafkaConsumer.poll(kafkaSpoutConfig.getPollTimeoutMs());
+            final int numPolledRecords = consumerRecords.count();
+            LOG.debug("Polled [{}] records from Kafka. [{}] uncommitted offsets across all topic partitions", numPolledRecords, numUncommittedOffsets);
+            return consumerRecords;
+        } catch(OffsetOutOfRangeException e) {
+            LOG.error("Offset out of range! Resetting partitions based on default strategy", e);
+            for (TopicPartition tp: e.partitions()) {
+                kafkaConsumer.seekToBeginning(toArrayList(tp));
+                long fetchOffset = kafkaConsumer.position(tp);
+                setAcked(tp, fetchOffset);
+                final Map<TopicPartition, OffsetAndMetadata> nextCommitOffsets = new HashMap<>();
+                nextCommitOffsets.put(tp, new OffsetAndMetadata(fetchOffset, "{reset out of range}"));
+                kafkaConsumer.commitSync(nextCommitOffsets);
+
+            }
+            final ConsumerRecords<K, V> consumerRecords = kafkaConsumer.poll(kafkaSpoutConfig.getPollTimeoutMs());
+            final int numPolledRecords = consumerRecords.count();
+            LOG.debug("Polled [{}] records from Kafka. [{}] uncommitted offsets across all topic partitions", numPolledRecords, numUncommittedOffsets);
+            return consumerRecords;
+        }
     }
 
     private void doSeekRetriableTopicPartitions() {
